@@ -13,15 +13,17 @@
 
 #include <stdio.h>
 #include "pico/stdlib.h"
+#include <stdbool.h>
+#include "card.h"
 
 const char *banner=R"banner(
-            _______ ___     __   __ _______ _______ _______ _______ 
-           |  _    |   |   |  | |  |       |       |   _   |       |
-           | |_|   |   |   |  | |  |    ___|_     _|  |_|  |    ___|
-           |       |   |   |  |_|  |   |___  |   | |       |   | __ 
-           |  _   ||   |___|       |    ___| |   | |       |   ||  |
-           | |_|   |       |       |   |___  |   | |   _   |   |_| |
-           |_______|_______|_______|_______| |___| |__| |__|_______|)banner";
+  ____  _         _____           
+ |  _ \(_) ___ __|_   _|_ _  __ _ 
+ | |_) | |/ __/ _ \| |/ _` |/ _` |
+ |  __/| | (_| (_) | | (_| | (_| |
+ |_|   |_|\___\___/|_|\__,_|\__, |
+                            |___/ 
+)banner";
 
 
 char *version="1.0.1";
@@ -31,12 +33,15 @@ char *version="1.0.1";
 #define  MAX_IR_CHAIN_LEN   MAX_DEVICES_LEN * MAX_IR_LEN   // Maximum total length of JTAG chain w/ IR selected
 #define  MAX_DR_LEN         4096                           // Maximum length of data register
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof(*array))
+#define MAX_CHANNELS 16
 
 
-const uint onboardLED = 25;
-const uint unusedGPIO = 28;                               // Pins on Pico are accessed using GPIO names
+const uint onboardLED    = 25;
+const uint unusedGPIO    = 28;                               // Pins on Pico are accessed using GPIO names
 const uint MAX_NUM_JTAG  = 32;
-const uint maxChannels = 9;                               // Max number of channels supported by Pico  
+const uint spi_mosi      = 19;
+const uint spi_miso      = 16;
+                   
 
 char cmd;
 
@@ -61,15 +66,19 @@ static const char * const jep106[][126] = {
 #include "jep106.inc"
 };
 
+// This is our GPIO to Channel mapping on the Picotag
+const uint channelToGpio[MAX_CHANNELS] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 28, 21, 15, 20,
+};
 
 
 void splashScreen(void)
 {
     printf("\n%s",banner);
     printf("\n");
-    printf("\n          [ JTAGulator alternative for Raspberry Pi RP2040 Dev Boards ]");
+    printf("\n          [ JTAGulator alternative for Raspberry Pi RP2040           ]");
     printf("\n          +-----------------------------------------------------------+");
-    printf("\n          | @Aodrulez             https://github.com/Aodrulez/blueTag |");
+    printf("\n          | @rileyporter             https://github.com/ril3y/Picotag |");
     printf("\n          +-----------------------------------------------------------+\n\n");   
 }
 
@@ -85,18 +94,20 @@ void showMenu(void)
     printf("     \"v\" = Show current version\n");
     printf("     \"p\" = Toggle pulsing of pins (Default:ON)\n");
     printf("     \"j\" = Perform JTAG pinout scan\n");
-    printf("     \"s\" = Perform SWD pinout scan\n\n");
+    printf("     \"s\" = Perform SWD pinout scan\n");
+    printf("     \"d\" = Attempt to dump SPI flash to MMC\n");
+    printf("     \"ls\" = List files on SDCARD card\n\n");
     printf(" [ Note: Disable 'local echo' in your terminal emulator program ]\n\n");
 }
 
 int getChannels(void)
 {
     char x;
-    printf("     Enter number of channels hooked up (Min 4, Max %d): ", maxChannels);
+    printf("     Enter number of channels hooked up (Min 4, Max %d): ", MAX_CHANNELS);
     x = getc(stdin);
     printf("%c\n",x);
     x = x - 48;
-    while(x < 4 || x > maxChannels)
+    while(x < 4 || x > MAX_CHANNELS)
     {
         printf("     Enter a valid value: ");
         x = getc(stdin);
@@ -112,16 +123,16 @@ void setPinsHigh(int channelCount)
 {
     for(int x = 0; x < channelCount; x++)
     {
-        gpio_put(x, 1);
+        gpio_put(channelToGpio[x], 1);
     }
 }
 
 // Function that sets all used channels to output high
-void setPinsLoW(int channelCount)
+void setPinsLow(int channelCount)
 {
     for(int x = 0; x < channelCount; x++)
     {
-        gpio_put(x, 0);
+        gpio_put(channelToGpio[x], 0);
     }
 }
 
@@ -130,7 +141,7 @@ void resetPins(int channelCount)
 {
     setPinsHigh(channelCount);
     sleep_ms(100);
-    setPinsLoW(channelCount);
+    setPinsLow(channelCount);
     sleep_ms(100);
     setPinsHigh(channelCount);
     sleep_ms(100);
@@ -138,7 +149,7 @@ void resetPins(int channelCount)
 
 void pulsePins(int channelCount)
 {
-    setPinsLoW(channelCount);
+    setPinsLow(channelCount);
     sleep_ms(20);
     setPinsHigh(channelCount);
     sleep_ms(20);
@@ -147,12 +158,12 @@ void pulsePins(int channelCount)
 void jtagConfig(uint tdiPin, uint tdoPin, uint tckPin, uint tmsPin)
 {
     // Output
-    gpio_set_dir(tdiPin, GPIO_OUT);
-    gpio_set_dir(tckPin, GPIO_OUT);
-    gpio_set_dir(tmsPin, GPIO_OUT);
+    gpio_set_dir(channelToGpio[tdiPin], GPIO_OUT);
+    gpio_set_dir(channelToGpio[tckPin], GPIO_OUT);
+    gpio_set_dir(channelToGpio[tmsPin], GPIO_OUT);
 
     // Input
-    gpio_set_dir(tdoPin, GPIO_IN);
+    gpio_set_dir(channelToGpio[tdoPin], GPIO_IN);
 }
 
 // Generate one TCK pulse. Read TDO inside the pulse.
@@ -160,41 +171,41 @@ void jtagConfig(uint tdiPin, uint tdoPin, uint tckPin, uint tmsPin)
 bool tdoRead(void)
 {
     bool tdoStatus;
-    gpio_put(jTCK, 1);
-    tdoStatus=gpio_get(jTDO);
-    gpio_put(jTCK, 0);
-    return(tdoStatus);
+    gpio_put(channelToGpio[jTCK], 1);
+    tdoStatus = gpio_get(channelToGpio[jTDO]);
+    gpio_put(channelToGpio[jTCK], 0);
+    return tdoStatus;
 }
-
 
 // Generates on TCK Pulse
 // Expects TCK to be low when called & ignores TDO
 void tckPulse(void)
 {
     bool tdoStatus;
-    tdoStatus=tdoRead();
+    tdoStatus = tdoRead();
 }
 
 
 void tdiHigh(void)
 {
-    gpio_put(jTDI, 1);
+    gpio_put(channelToGpio[jTDI], 1);
 }
 
 void tdiLow(void)
 {
-    gpio_put(jTDI, 0);
+    gpio_put(channelToGpio[jTDI], 0);
 }
 
 void tmsHigh(void)
 {
-    gpio_put(jTMS, 1);
+    gpio_put(channelToGpio[jTMS], 1);
 }
 
 void tmsLow(void)
 {
-    gpio_put(jTMS, 0);
+    gpio_put(channelToGpio[jTMS], 0);
 }
+
 
 
 
@@ -463,17 +474,17 @@ void jtagScan(void)
 {
     int channelCount;
     uint32_t tempDeviceId;
-    bool foundPinout=false;
-    jDeviceCount=0;
-    channelCount = getChannels();            // First get the number of channels hooked
+    bool foundPinout = false;
+    jDeviceCount = 0;
+    channelCount = getChannels();  // First get the number of channels hooked
     //resetPins(channelCount);
-    jTDI = unusedGPIO;            // Assign TDI to an unused Pin on Pico so it doesn't interfere with the scan
-    jTDO, jTCK, jTMS, jTRST = 0;
-    
-    for(int p=0; p<channelCount; p++)
+    jTDI = unusedGPIO;  // Assign TDI to an unused Pin on Pico so it doesn't interfere with the scan
+    jTDO = jTCK = jTMS = jTRST = 0;
+
+    for(int p = 0; p < channelCount; p++)
     {
         jTDO = p;
-        for(int q=0; q < channelCount; q++)
+        for(int q = 0; q < channelCount; q++)
         {
             jTCK = q;
             if (jTCK == jTDO)
@@ -481,7 +492,7 @@ void jtagScan(void)
                 continue;
             }
 
-            for(int r=0; r < channelCount; r++)
+            for(int r = 0; r < channelCount; r++)
             {
                 jTMS = r;
                 if (jTMS == jTCK || jTMS == jTDO)
@@ -496,25 +507,15 @@ void jtagScan(void)
                     pulsePins(channelCount);
                 }
                 getDeviceIDs(1);
-                tempDeviceId=deviceIDs[0];
+                tempDeviceId = deviceIDs[0];
 
-                if( (deviceIDs[0] != -1) && (deviceIDs[0] & 1) )         //Ignore if received Device ID is 0xFFFFFFFF or if bit 0 != 1
+                if ((deviceIDs[0] != -1) && (deviceIDs[0] & 1))  // Ignore if received Device ID is 0xFFFFFFFF or if bit 0 != 1
                 {
-                    // We found something by idcode scan. For future debugging uncomment these
-                    
-                    tempDeviceId=deviceIDs[0];
-                    
-                    //foundPinout=true;
-                    //displayPinout();
-                    //printf("[ 0x%08x ]\n", deviceIDs[0]);
+                    tempDeviceId = deviceIDs[0];
 
-                    // IDCode scan is complete & we found a valid pinout
-                    // Let's mount Bypass scan to be thorough
-                    for(int s=0; s < channelCount; s++)
+                    for(int s = 0; s < channelCount; s++)
                     {
-                        // onBoard LED notification
                         gpio_put(onboardLED, 1);
-
 
                         jTDI = s;
                         if (jTDI == jTMS || jTDI == jTCK || jTDI == jTDO)
@@ -529,39 +530,28 @@ void jtagScan(void)
                             pulsePins(channelCount);
                         }
 
-                        jDeviceCount=detectDevices();
-                        //printf(" detected device number: %d\n", jDeviceCount);
-
-                        uint32_t dataIn;
-                        uint32_t dataOut;
-                        dataIn=uint32Rand();
-                        dataOut=bypassTest(jDeviceCount, dataIn);
+                        jDeviceCount = detectDevices();
+                        uint32_t dataIn = uint32Rand();
+                        uint32_t dataOut = bypassTest(jDeviceCount, dataIn);
                         if(dataIn == dataOut)
                         {
-                            foundPinout=true;
-                            //displayPinout();
-                            //printf("\t[ 0x%08x ]\n", deviceIDs[0]);
-
-                            // Bypass scan found TDI too, now let's enumerate devices in the scan chain
+                            foundPinout = true;
                             setPinsHigh(channelCount);
                             jtagConfig(jTDI, jTDO, jTCK, jTMS);
                             if (jPulsePins)
                             {
                                 pulsePins(channelCount);
                             }
-                            // populate global array with details of all devices in the chain
                             getDeviceIDs(jDeviceCount);
-                            
 
-                            // Found all pins except nTRST, so let's try
-                            xTDI=jTDI;
-                            xTDO=jTDO;
-                            xTCK=jTCK;
-                            xTMS=jTMS;
-                            xTRST=0;
-                            for(int t=0; t < channelCount; t++)
+                            xTDI = jTDI;
+                            xTDO = jTDO;
+                            xTCK = jTCK;
+                            xTMS = jTMS;
+                            xTRST = 0;
+                            for(int t = 0; t < channelCount; t++)
                             {
-                                jTRST=t;
+                                jTRST = t;
                                 if (jTRST == jTMS || jTRST == jTCK || jTRST == jTDO || jTRST == jTDI)
                                 {
                                     continue;
@@ -572,44 +562,38 @@ void jtagScan(void)
                                 {
                                     pulsePins(channelCount);
                                 }
-                                gpio_put(jTRST, 1);
-                                gpio_put(jTRST, 0);
-                                sleep_ms(100);          // Give device time to react
+                                gpio_put(channelToGpio[jTRST], 1);
+                                gpio_put(channelToGpio[jTRST], 0);
+                                sleep_ms(100);  // Give device time to react
 
-                                
                                 getDeviceIDs(1);
-                                if (tempDeviceId != deviceIDs[0] )
+                                if (tempDeviceId != deviceIDs[0])
                                 {
-                                    //printf("   Possible nTRST: %x", jTRST);
-                                    deviceIDs[0]=tempDeviceId;
-                                    xTRST=jTRST;
+                                    deviceIDs[0] = tempDeviceId;
+                                    xTRST = jTRST;
                                 }
                             }
-                            // Done enumerating everything. 
                             displayPinout();
                             displayDeviceDetails();
                         }
-                        // onBoard LED notification
                         gpio_put(onboardLED, 0);
                     }
                 }
             }
         }
     }
-    // IDcode scan should definitely identify valid devices. 
-    // If none are detected, the channels are inaccurate
-    if( foundPinout == false )
+    if(!foundPinout)
     {
         printf("     No JTAG devices found. Please try again.\n\n");
     }
-
 }
+
 
 
 // Initialize all available channels & set them as output
 void initChannels(void)
 {
-    for(int x=0; x < maxChannels ; x++)
+    for(int x=0; x < MAX_CHANNELS ; x++)
     {
         gpio_init(x);
         gpio_set_dir(x, GPIO_OUT);
@@ -635,11 +619,11 @@ bool swdDeviceFound=false;
 int getSwdChannels(void)
 {
     char x;
-    printf("     Enter number of channels hooked up (Min 2, Max %d): ", maxChannels);
+    printf("     Enter number of channels hooked up (Min 2, Max %d): ", MAX_CHANNELS);
     x = getc(stdin);
     printf("%c\n",x);
     x = x - 48;
-    while(x < 2 || x > maxChannels)
+    while(x < 2 || x > MAX_CHANNELS)
     {
         printf("     Enter a valid value: ");
         x = getc(stdin);
@@ -905,6 +889,7 @@ void swdScan(void)
 int main()
 {
     stdio_init_all();
+    sdcard_init();
 
     // GPIO init
     gpio_init(onboardLED);
